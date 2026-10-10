@@ -1,0 +1,201 @@
+"""Batched synthesis (fast_tr_drifting.batched): each row of a padded batch equals the single-request path with the same
+seed. CPU, tiny models, no downloads."""
+
+import pytest
+import torch
+
+from fast_tr_drifting.audio import HOP_LENGTH
+from fast_tr_drifting.batched import acoustic_batch, stream_batched, stream_windows, vocode_masked
+from fast_tr_drifting.fast import stream_vocoder
+from fast_tr_drifting.models.prosody_net import ProsodyPredictor
+from fast_tr_drifting.models.tts import DriftingTTS
+from fast_tr_drifting.synthesize import Synthesizer
+from fast_tr_drifting.text import text_to_ids
+from fast_tr_drifting.vocoder import Vocoder, Vocos
+
+MODEL = {"text": {"d": 16, "heads": 2, "layers": 2, "ffn": 32, "dropout": 0.0, "spk_dim": 8},
+         "gen": {"hidden": 32, "depth": 2, "heads": 2, "patch": 2, "mlp_ratio": 4.0, "n_registers": 4,
+                 "noise_classes": 8, "noise_coords": 3, "residual_prior": True, "num_steps": 1},
+         "pitch": {"enabled": True}}
+NET = {"kind": "drift", "d": 32, "layers": 1, "heads": 2, "ffn": 64, "noise_tok": 4, "noise_glob": 4, "out_init": 1.0}
+TEXTS = ["merhaba.", "bu bir deneme cümlesidir, tek adımda üretilir.", "kısa bir cümle daha?",
+         "yapay zekâ modelleri her geçen gün daha hızlı hâle geliyor."]
+
+
+def _jitter(*modules, scale: float = 0.1) -> None:
+    """Zero-initialised output layers would hide most of the network."""
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for m in modules:
+            for p in m.parameters():
+                p.add_(torch.randn_like(p) * scale)
+
+
+def _models():
+    torch.manual_seed(0)
+    model = DriftingTTS(MODEL, num_speakers=3).eval()
+    pred = ProsodyPredictor(NET, cond_dim=16 + 8 + 2).eval()
+    _jitter(model, pred)
+    return model, pred
+
+
+@pytest.mark.parametrize("prosody", [None, "regressor", "sampled"])
+def test_acoustic_batch_rows_match_single_requests(prosody):
+    model, pred = _models()
+    pred = None if prosody is None else pred
+    ids = [text_to_ids(t) for t in TEXTS]
+    spk, scale, pt = 2, 1.3, 0.7
+    mel, lens = acoustic_batch(model, ids, spk, 1.5, 0.5, scale, [torch.Generator().manual_seed(s) for s in range(4)],
+                               prosody=pred, prosody_temperature=pt, prosody_durations=prosody or "sampled")
+    assert mel.shape[0] == 4 and len(set(lens.tolist())) > 1  # different lengths: the padding matters
+    for b, x in enumerate(ids):
+        g = torch.Generator().manual_seed(b)
+        text, text_len, s = torch.tensor([x]), torch.tensor([len(x)]), torch.tensor([spk])
+        durations = pitch = None
+        if pred is not None:  # Synthesizer._mel: the prosody predictor first, from the same generator
+            durations, pitch = pred.predict(model, text, text_len, s, pt, scale, generator=g)
+            durations = None if prosody == "regressor" else durations
+        ref, ref_len = model.synthesize(text, text_len, s, cfg_scale=1.5, temperature=0.5, length_scale=scale,
+                                        generator=g, durations=durations, pitch=pitch)
+        t = int(lens[b])
+        assert t == int(ref_len[0])
+        torch.testing.assert_close(mel[b: b + 1, :, :t], ref, rtol=0, atol=1e-5)
+        assert not mel[b, :, t:].any()  # zero after the row's length
+
+
+def _tiny_vocos(seed: int = 0) -> Vocoder:
+    """A random 2-layer Vocos (Vocos's initialisation: truncated normal, std 0.02) with 8 frames of context."""
+    torch.manual_seed(seed)
+    model = Vocos(100, 16, 32, 2)
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, (torch.nn.Conv1d, torch.nn.Linear)):
+                torch.nn.init.trunc_normal_(m.weight, std=0.02)
+                torch.nn.init.zeros_(m.bias)
+    return Vocoder(model, "cpu", "tiny", context=8)
+
+
+def test_vocode_masked_rows_match_single_rows():
+    voc = _tiny_vocos()
+    torch.manual_seed(1)
+    mel = torch.randn(3, 100, 21) * 0.5 - 5
+    lengths = torch.tensor([21, 7, 13])
+    wav = vocode_masked(voc, mel, lengths)
+    assert wav.shape == (3, 21 * HOP_LENGTH)
+    for b, t in enumerate(lengths.tolist()):
+        torch.testing.assert_close(wav[b, : t * HOP_LENGTH], voc(mel[b: b + 1, :, :t])[0], rtol=0, atol=1e-5)
+        assert not wav[b, t * HOP_LENGTH:].any()
+
+
+@pytest.mark.parametrize("t", [5, 12, 13, 40, 41, 97])
+def test_stream_windows_are_those_of_stream_vocoder(t):
+    def voc(x):  # each sample holds the index of its frame in the window
+        return torch.arange(x.shape[-1]).repeat_interleave(4)[None]
+
+    mel = torch.zeros(1, 100, t)
+    pieces = list(stream_vocoder(voc, mel, hop=4, first=4, chunk=16, context=8))
+    windows = stream_windows(t, first=4, chunk=16, context=8)
+    assert len(windows) == len(pieces)
+    for (_a, _b, start, n), piece in zip(windows, pieces):
+        assert piece.numel() == n * 4 and int(piece[0]) == start  # the window's frame index of the kept part
+
+
+def _synth(tmp_path, prosody: bool) -> Synthesizer:
+    model, pred = _models()
+    torch.save({"ema": model.state_dict(), "config": {"model": MODEL}, "num_speakers": 3,
+                "stats": {"mean": -5.0, "std": 2.0, "backend": "bigvgan"}}, tmp_path / "tts.pt")
+    kw = {}
+    if prosody:
+        torch.save({"ema": pred.net.state_dict(), "stats": pred.stats.state_dict(), "net_cfg": NET, "cond_dim": 26,
+                    "temperature": 0.5}, tmp_path / "prosody.pt")
+        kw = {"prosody": str(tmp_path / "prosody.pt"), "prosody_durations": "regressor"}
+    return Synthesizer(tmp_path / "tts.pt", "cpu", vocoder=_tiny_vocos(), **kw)
+
+
+@pytest.mark.parametrize("prosody", [False, True])
+def test_stream_batched_matches_stream(tmp_path, prosody):
+    synth = _synth(tmp_path, prosody)
+    texts = ["Merhaba! Bugün hava çok güzel.", "Bu bir deneme.", "Kısa bir cümle daha? Evet, bir tane daha.",
+             "Yapay zekâ modelleri her geçen gün daha hızlı ve daha verimli hâle geliyor."]
+    kw = dict(speaker=2, cfg_scale=1.5, temperature=0.5, pause=0.05, first=4, chunk=16)
+    got = {i: [] for i in range(len(texts))}
+    rounds = list(stream_batched(synth, texts, seeds=[3, 4, 5, 6], **kw))
+    assert {i for i, _ in rounds[0]} == set(range(len(texts)))  # every request has a piece after the first round
+    assert len(rounds) > 3  # the mels stream in several windows
+    for out in rounds:
+        for i, piece in out:
+            got[i].append(piece)
+    for i, text in enumerate(texts):
+        ref = list(synth.stream(text, seed=3 + i, **kw))
+        assert [p.numel() for p in got[i]] == [p.numel() for p in ref]
+        torch.testing.assert_close(torch.cat(got[i]), torch.cat(ref), rtol=0, atol=1e-5)
+
+
+def test_batchable_prosody_sources(tmp_path):
+    from fast_tr_drifting.batched import batchable, synth_mels
+
+    synth = _synth(tmp_path, prosody=True)
+    assert batchable(synth)
+    other = synth.variant(prosody=synth.prosody, prosody_durations="sampled", prosody_duration_temperature=0.3)
+    assert not batchable(other)  # a duration row of its own: not batched
+    with pytest.raises(NotImplementedError):
+        synth_mels(other, ["merhaba."], 2, 1.0, 1.0, [torch.Generator()])
+
+
+@pytest.mark.parametrize("buckets", [2, 3])
+def test_length_buckets_keep_every_row(buckets):
+    from fast_tr_drifting.batched import Serving, length_groups
+
+    groups = length_groups([5, 1, 4, 4, 9, 2], buckets)
+    assert sorted(sum(groups, [])) == list(range(6)) and len(groups) == buckets
+    model, pred = _models()
+    ids = [text_to_ids(t) for t in TEXTS]
+    gens = lambda: [torch.Generator().manual_seed(s) for s in range(4)]  # noqa: E731
+    ref, ref_len = acoustic_batch(model, ids, 2, 1.5, 0.5, 1.3, gens(), prosody=pred, prosody_temperature=0.7)
+    mel, lens = acoustic_batch(model, ids, 2, 1.5, 0.5, 1.3, gens(), prosody=pred, prosody_temperature=0.7,
+                               serving=Serving(buckets=buckets, min_bucket=1))
+    assert torch.equal(lens, ref_len)
+    torch.testing.assert_close(mel, ref, rtol=0, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_in_place_draws_on_cuda_match_single_requests():
+    """On CUDA the per-request noise is drawn in place into the padded batch: the same values as torch.randn."""
+    model, pred = _models()
+    model, pred = model.cuda(), pred.cuda()
+    ids = [text_to_ids(t) for t in TEXTS]
+    tf32, torch.backends.cudnn.allow_tf32 = torch.backends.cudnn.allow_tf32, False  # exact convolutions
+    try:
+        _compare_cuda(model, pred, ids)
+    finally:
+        torch.backends.cudnn.allow_tf32 = tf32
+
+
+def _compare_cuda(model, pred, ids):
+    mel, lens = acoustic_batch(model, ids, 2, 1.5, 0.5, 1.3,
+                               [torch.Generator(device="cuda").manual_seed(s) for s in range(4)], prosody=pred,
+                               prosody_temperature=0.7)
+    for b, x in enumerate(ids):
+        g = torch.Generator(device="cuda").manual_seed(b)
+        text, n, s = torch.tensor([x], device="cuda"), torch.tensor([len(x)], device="cuda"), \
+            torch.tensor([2], device="cuda")
+        durations, pitch = pred.predict(model, text, n, s, 0.7, 1.3, generator=g)
+        ref, _ = model.synthesize(text, n, s, cfg_scale=1.5, temperature=0.5, length_scale=1.3, generator=g,
+                                  durations=durations, pitch=pitch)
+        t = int(lens[b])
+        torch.testing.assert_close(mel[b: b + 1, :, :t], ref, rtol=0, atol=1e-4)
+
+
+def test_expand_by_durations_is_the_alignment_matmul():
+    from fast_tr_drifting.batched import expand_by_durations
+    from fast_tr_drifting.models.text_encoder import frames_to_alignment
+    torch.manual_seed(0)
+    h, mu = torch.randn(3, 5, 7), torch.randn(3, 4, 7)
+    frames = torch.randint(0, 4, (3, 7)).float()
+    frames[2] = 0  # no frames at all: one zero frame, as frames_to_alignment
+    x_mask = torch.ones(3, 1, 7)
+    x_mask[1, :, 5:] = 0
+    attn, y_len = frames_to_alignment(frames, x_mask)
+    ref = DriftingTTS.frame_condition(h, mu, attn)
+    got = expand_by_durations(torch.cat([mu, h], 1), frames * x_mask[:, 0], int(y_len.max()))
+    assert torch.equal(got, ref)
