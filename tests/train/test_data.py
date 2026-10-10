@@ -1,0 +1,163 @@
+"""Data preparation (prepare, merge-data), the dataset, its samplers and the speaker balance."""
+
+import json
+
+import pytest
+import torch
+
+from .helpers import fake_parquet, train_extras
+
+train_extras()
+
+from fast_tr_drifting.audio import FRAME_RATE, N_MELS  # noqa: E402
+from fast_tr_drifting.cli import main  # noqa: E402
+from fast_tr_drifting.train.data import BucketBatchSampler, MelDataset, collate  # noqa: E402
+
+
+def test_prepare_and_dataset(tmp_path):
+    fake_parquet(tmp_path / "x.parquet")
+    out = tmp_path / "prep"
+    main(["prepare", "--parquet-glob", str(tmp_path / "*.parquet"), "--out", str(out), "--workers", "2",
+          "--val-size", "0", "--no-trim"])
+    stats = json.loads((out / "stats.json").read_text())
+    assert stats["utterances"] == 30 and stats["speakers"] == 3
+    lines = [json.loads(line) for line in open(out / "index.jsonl")]
+    assert abs(lines[0]["frames"] - FRAME_RATE * 1.0) < 3
+    assert lines[3]["norm_text"] == "merhaba dünya üç."
+
+    ds = MelDataset(out, "train", min_quality=60, min_frames=10)
+    assert len(ds) == 20
+    item = ds[0]
+    assert item["mel"].shape[0] == N_MELS and item["text"][0] == 1
+    sampler = BucketBatchSampler([ds.frames(i) for i in range(len(ds))], max_frames=1000, max_batch=4)
+    batches = list(iter(sampler))
+    assert all(len(b) <= 4 for b in batches)
+    batch = collate([ds[i] for i in batches[0]])
+    assert batch["mel"].shape[0] == len(batches[0]) and batch["mel"].shape[1] == N_MELS
+    assert batch["mel_len"].max() == batch["mel"].shape[2]
+
+
+def test_bigvgan_logmel_frames_and_prepare_backend(tmp_path):
+    from fast_tr_drifting.audio import BigVGANLogMel, make_logmel
+
+    mel = BigVGANLogMel()(torch.zeros(2, 24_000))
+    assert mel.shape == (2, N_MELS, 24_000 // 256) and torch.isfinite(mel).all()
+    assert abs(mel.min().item() - torch.log(torch.tensor(1e-5)).item()) < 1e-3  # silence -> log(1e-5) floor
+    assert isinstance(make_logmel("bigvgan"), BigVGANLogMel)
+    with pytest.raises(ValueError):
+        make_logmel("vocos")  # the released models use the BigVGAN-style front end only
+
+    fake_parquet(tmp_path / "x.parquet", n=6)
+    out = tmp_path / "prep"
+    main(["prepare", "--parquet-glob", str(tmp_path / "*.parquet"), "--out", str(out), "--workers", "1",
+          "--val-size", "0", "--no-trim", "--backend", "bigvgan"])
+    assert json.loads((out / "stats.json").read_text())["backend"] == "bigvgan"
+    assert MelDataset(out, "train", min_frames=1).backend == "bigvgan"
+
+
+def test_f0_is_sampled_at_the_mel_frame_centres():
+    import numpy as np
+
+    pytest.importorskip("pyworld")
+    from fast_tr_drifting.audio import HOP_LENGTH, SAMPLE_RATE, extract_f0
+
+    t = np.arange(int(1.5 * SAMPLE_RATE)) / SAMPLE_RATE
+    freq = 120.0 + 200.0 * t  # steep harmonic chirp: half a hop (5.3 ms) is a ~1 Hz pitch offset
+    phase = 2 * np.pi * np.cumsum(freq) / SAMPLE_RATE
+    wav = 0.3 * sum(np.sin(k * phase) / k for k in range(1, 6))
+    frames = len(t) // HOP_LENGTH
+    i = np.arange(15, frames - 15)
+    for backend, centre in (("bigvgan", 0.5),):
+        for method in ("dio", "harvest"):
+            f0 = extract_f0(wav, frames, method=method, backend=backend)
+            expected = 120.0 + 200.0 * (i + centre) * HOP_LENGTH / SAMPLE_RATE
+            assert np.abs(f0[i] - expected).mean() < 0.2, (backend, method)
+
+
+def test_dev_split_is_disjoint_and_leaves_val_unchanged():
+    from fast_tr_drifting.train.prepare import choose_validation
+
+    index = [{"speaker": f"s{i % 4}", "quality_score": 80, "audio_seconds": 5.0} for i in range(200)]
+    index += [{"speaker": "rare", "quality_score": 90, "audio_seconds": 5.0}] * 5  # < 20 utterances: never held out
+    val = choose_validation(index, 20, seed=0)
+    dev = choose_validation(index, 30, seed=1, exclude=val)
+    assert len(val) == 20 and len(dev) == 30 and not val & dev and max(val | dev) < 200
+    assert choose_validation(index, 20, seed=0) == val  # adding a dev split does not move val
+
+
+def test_merge_data_keeps_the_base_and_appends_new_speakers(tmp_path):
+    import numpy as np
+
+    def fake(root, speakers, frames, split="train"):
+        root.mkdir()
+        index, off, aoff = [], 0, 0
+        for i, (spk, n) in enumerate(zip(speakers, frames)):
+            index.append({"speaker": spk, "spk_id": sorted(set(speakers)).index(spk), "offset": off, "frames": n,
+                          "audio_offset": aoff, "audio_samples": n * 256, "split": split if i == 0 else "train",
+                          "norm_text": "a", "quality_score": None})
+            off, aoff = off + n, aoff + n * 256
+        (root / "index.jsonl").write_text("".join(json.dumps(e) + "\n" for e in index))
+        (root / "speakers.json").write_text(json.dumps({s: i for i, s in enumerate(sorted(set(speakers)))}))
+        (root / "stats.json").write_text(json.dumps({"backend": "bigvgan", "mean": float(len(root.name)), "std": 1.0}))
+        np.arange(off * 100, dtype=np.float16).tofile(root / "mels.bin")
+        np.arange(off, dtype=np.float16).tofile(root / "f0.bin")
+        np.arange(aoff, dtype=np.float16).tofile(root / "audio.bin")
+
+    fake(tmp_path / "base", ["a", "b"], [3, 4], split="val")
+    fake(tmp_path / "newvoice", ["new", "new"], [5, 2], split="val")
+    out = tmp_path / "merged"
+    main(["merge-data", str(tmp_path / "base"), str(tmp_path / "newvoice"), "--out", str(out), "--repeat", "1", "2"])
+    idx = [json.loads(line) for line in open(out / "index.jsonl")]
+    assert json.loads((out / "speakers.json").read_text()) == {"a": 0, "b": 1, "new": 2}
+    assert json.loads((out / "stats.json").read_text())["mean"] == 4.0  # base normalisation kept ("base")
+    assert len(idx) == 2 + 2 + 1  # the new voice's training utterance is listed twice, its held-out one once
+    mels = np.fromfile(out / "mels.bin", dtype=np.float16).reshape(-1, 100)
+    f0, audio = np.fromfile(out / "f0.bin", dtype=np.float16), np.fromfile(out / "audio.bin", dtype=np.float16)
+    new = [e for e in idx if e["speaker"] == "new"][0]
+    assert new["spk_id"] == 2 and new["offset"] == 7 and new["audio_offset"] == 7 * 256
+    assert mels.shape[0] == f0.shape[0] == 14 and audio.shape[0] == 14 * 256
+    assert mels[new["offset"], 0] == 0 and f0[new["offset"]] == 0  # first frame of the new voice's data
+
+
+def test_speaker_balance_weights_give_the_shares():
+    from fast_tr_drifting.train.data import speaker_balance_weights
+
+    speakers = [0] * 80 + [1] * 15 + [2] * 5
+    lengths = [100] * 80 + [100] * 15 + [300] * 5  # frames: speaker 1 has 1500, speaker 2 has 1500
+
+    def shares(w):
+        return {s: sum(x for x, t in zip(w, speakers) if t == s) for s in (0, 1, 2)}
+
+    w = speaker_balance_weights(speakers, lengths, {0: 0.5}, temperature=1.0)
+    assert sum(w) == pytest.approx(1.0) and len(set(w[:80])) == 1  # one speaker's utterances drawn alike
+    assert shares(w) == pytest.approx({0: 0.5, 1: 0.25, 2: 0.25})  # the rest in proportion to the frames
+    w = speaker_balance_weights(speakers, lengths, None, temperature=0.0)  # every speaker equally often
+    assert shares(w) == pytest.approx({0: 1 / 3, 1: 1 / 3, 2: 1 / 3})
+    w = speaker_balance_weights(speakers, lengths, {"2": 0.1}, temperature=1.0)  # keys may be strings (overrides)
+    assert shares(w) == pytest.approx({0: 0.9 * 8000 / 9500, 1: 0.9 * 1500 / 9500, 2: 0.1})
+    for bad in ({7: 0.1}, {0: 0.8, 1: 0.3}, {0: -0.1}):
+        with pytest.raises(ValueError):
+            speaker_balance_weights(speakers, lengths, bad)
+
+
+def test_weighted_bucket_sampler_draws_by_weight_and_resumes():
+    from collections import Counter
+
+    from fast_tr_drifting.train.data import WeightedBucketBatchSampler, speaker_balance_weights
+
+    speakers = [0] * 90 + [1] * 10
+    lengths = [50 + i % 40 for i in range(100)]
+    w = speaker_balance_weights(speakers, lengths, {1: 0.5})
+    kw = dict(max_frames=400, max_batch=4, bucket=32, seed=3, drop_last=False)
+    sampler = WeightedBucketBatchSampler(lengths, w, **kw)
+    drawn = Counter()
+    for _ in range(40):
+        batches = list(iter(sampler))
+        assert all(len(b) <= 4 and len(b) * max(lengths[i] for i in b) <= 400 for b in batches)
+        drawn.update(speakers[i] for b in batches for i in b)
+    assert sampler.epoch == 40 and sum(drawn.values()) == 40 * 100  # len(lengths) draws per epoch
+    assert abs(drawn[1] / 4000 - 0.5) < 0.03  # 10% of the utterances, half of the draws
+    again = WeightedBucketBatchSampler(lengths, w, **kw)
+    again.epoch = 39  # restored from a checkpoint
+    sampler.epoch = 39
+    assert list(iter(again)) == list(iter(sampler))

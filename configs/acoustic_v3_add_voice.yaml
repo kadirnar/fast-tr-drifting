@@ -1,0 +1,24 @@
+# Add a voice to the trained v3 model (how v3.1's `studio` voice was added; v3.2 keeps those weights): fine-tune on
+# the base corpus merged with the new voice's data, so the existing voices are kept. Prepare the new voice with the
+# same front end and merge it after the base corpus:
+#   fast-tr-drifting prepare --dataset <hf-dataset-id> --out data/new_voice --f0 --save-audio \
+#       --speaker-name new_voice --val-size 100 --dev-size 100 --val-max-seconds 16
+#   fast-tr-drifting merge-data --out data/train_new_voice data/train data/new_voice --repeat 1 2
+# The model grows one speaker row, initialised at the mean of the existing ones (grow_speakers), and the learned
+# kernel temperature is resumed from the checkpoint of train.init_from. 30k steps: 2.7 h on an RTX 5090.
+base: acoustic_v3.yaml
+
+data:
+  root: data/train_new_voice
+
+drift:
+  kyutai:
+    tau_init: 0.0708       # where v3's temperature ended (the value in the released config; init_from resumes it)
+
+train:
+  init_from: runs/acoustic_v3/model_ema.pt
+  steps: 30000
+  lr: 0.0001
+  warmup: 1000
+  sample_every: 5000
+  save_every: 5000

@@ -1,0 +1,34 @@
+# 2-D Mel-MAE feature encoder (`fast-tr-drifting train-mae`): a ResNet masked autoencoder over (frequency x time),
+# the mel analogue of the paper's latent-MAE. Its multi-scale activations define the drift kernel of the acoustic
+# model (`mae.path` of configs/acoustic_v3.yaml). 60k steps (batch 64): ~1.5 h on an RTX 5090.
+data:
+  root: data/train
+  min_quality: 0          # the feature encoder benefits from all data
+  max_frames: 2812
+
+model:
+  type: 2d
+  n_mels: 100
+  base_channels: 32       # stages: 32, 64, 128, 256 channels
+  layers: [2, 2, 2, 2]
+  input_patch: [2, 2]     # (frequency, time) patchification -> 50 x 128 grid for a 256-frame crop
+  mask_patch: [10, 8]     # masked (frequency, time) blocks, in mel bins / frames
+  speaker_head: true      # speaker classification fine-tuning (paper: "cls ft")
+
+train:
+  seed: 0
+  steps: 30000            # the released encoder: 60000 (train.steps=60000)
+  batch_size: 64
+  crop_frames: 256
+  mask_ratio: 0.5         # paper: 50% masking
+  lr: 0.001
+  weight_decay: 0.01
+  warmup: 1000
+  schedule: cosine
+  grad_clip: 2.0
+  ema_decay: 0.9995
+  cls_weight: 0.1
+  cls_finetune_steps: 3000   # last steps add the classification loss
+  num_workers: 6
+  log_every: 100
+  save_every: 2000

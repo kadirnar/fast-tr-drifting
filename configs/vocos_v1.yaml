@@ -1,0 +1,39 @@
+# Vocos v1 (`vocos-ft`): fine-tune the pretrained Vocos on the BigVGAN-style mels of a trained TTS model
+# (ground-truth alignment), `fast-tr-drifting finetune-vocoder`. The ISTFT head switches to `same` padding so that
+# F mel frames map to F * 256 samples, aligned as BigVGAN's uncentred frames. Vocos v2 continues this run.
+data:
+  root: data/train_new_voice   # the merged corpus with the studio voice (`prepare --f0 --save-audio`, merge-data)
+  min_quality: 0           # the released vocoders: the acoustic model's data filters, not the quality score (the
+  max_frames: 1500         # studio voice has none)
+  filters:                 # as configs/acoustic_v3.yaml (needs scores.jsonl; unscored utterances pass)
+    min_mos: 3.0
+    min_spk_sim: 0.5
+    rate: [8, 20]
+    min_bandwidth: 10000
+    max_cer: 0.15
+
+tts:
+  path: runs/acoustic_v3_add_voice/model_ema.pt   # the acoustic model whose mels it learns (v3.1's weights)
+
+vocoder:
+  arch: vocos
+  init: charactr/vocos-mel-24khz   # pretrained Vocos; its input layer adapts to our mels during fine-tuning
+
+train:
+  seed: 0
+  steps: 40000
+  batch_size: 16
+  batch_frames: 24000
+  segment_frames: 64       # 64 mel frames <-> 16384 samples
+  gta_prob: 0.8            # fraction of batches with generated mels (the rest: recorded mels)
+  gta_temperature: 0.3     # noise temperature of the generated mels (the released model's)
+  lr: 0.0001
+  grad_clip: 10.0
+  mel_loss_coeff: 45.0
+  mrd_loss_coeff: 0.1
+  disc_warmup_steps: 2000  # train the fresh discriminators first, generator frozen
+  num_workers: 4
+  log_every: 100
+  sample_every: 5000
+  num_samples: 2
+  save_every: 2500
