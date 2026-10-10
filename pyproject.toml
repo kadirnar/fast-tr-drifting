@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-tr-drifting"
+version = "0.1.0"
+description = "Fast one-step Turkish text-to-speech with drifting models: streaming, batched serving and training"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Kadir Nar", email = "kadir.nar@hotmail.com" }]
+keywords = ["text-to-speech", "tts", "turkish", "drifting", "one-step", "streaming", "vocos"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "torch>=2.4",
+    "numpy",
+    "huggingface_hub",
+    "soundfile",
+]
+
+[project.optional-dependencies]
+# the counter-based noise kernel; Triton ships with the CUDA builds of PyTorch on Linux (PyTorch fallback otherwise)
+triton = ["triton; platform_system == 'Linux'"]
+# examples/server.py and examples/client_load.py
+serve = ["fastapi", "uvicorn", "websockets"]
+# training (fast_tr_drifting.train): data preparation, Mel-MAE, acoustic model, prosody predictor, Vocos fine-tuning
+train = [
+    "torchaudio>=2.4",
+    "pyyaml",
+    "numba",
+    "pyworld",
+    "setuptools<81",   # pyworld 0.3.5 imports pkg_resources at runtime
+    "pyarrow",
+    "tqdm",
+    "tensorboard",
+    "vocos",           # its discriminators and losses (the inference vocoder is vendored)
+]
+# evaluation judges (benchmark, evaluate, prosody): Whisper large-v3, WavLM + ECAPA, UTMOSv2 (install torchvision from
+# the same index as torch first: UTMOSv2 pulls it in)
+eval = [
+    "torchaudio>=2.4",
+    "pyyaml",
+    "numba",
+    "pyworld",
+    "setuptools<81",
+    "librosa",
+    "faster-whisper",
+    "transformers",
+    "safetensors",
+    "utmosv2 @ git+https://github.com/sarulab-speech/UTMOSv2.git@v1.3.0",
+]
+# data scoring (`fast-tr-drifting score`): Whisper large-v3, DNSMOS, ECAPA speaker similarity
+score = ["faster-whisper>=1.1", "rapidfuzz", "speechmos", "onnx", "onnx2torch", "librosa", "speechbrain>=1.0"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+fast-tr-drifting = "fast_tr_drifting.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kadirnar/fast-tr-drifting"
+Models = "https://huggingface.co/Vyvo/drifting-tts-tr"
+Training-repository = "https://github.com/kadirnar/drifting-tts"
+
+[tool.setuptools.packages.find]
+include = ["fast_tr_drifting*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E731", "B905"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

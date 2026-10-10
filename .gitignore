@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+# outputs, weights, data and run directories
+*.wav
+*.pt
+*.ckpt
+*.safetensors
+*.json.gz
+outputs/
+runs/
+data/
+release/
+tb/

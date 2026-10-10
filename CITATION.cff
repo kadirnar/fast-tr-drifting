@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it, and the drifting paper it builds on."
+title: "fast-tr-drifting: one-step Turkish text-to-speech with drifting models, streaming and batched"
+authors:
+  - family-names: Nar
+    given-names: Kadir
+license: MIT
+repository-code: "https://github.com/kadirnar/fast-tr-drifting"
+version: 0.1.0
+date-released: 2026-10-10
+references:
+  - type: article
+    title: "Generative Modeling via Drifting"
+    authors:
+      - family-names: Deng
+        given-names: Mingyang
+      - family-names: Li
+        given-names: He
+      - family-names: Li
+        given-names: Tianhong
+      - family-names: Du
+        given-names: Yilun
+      - family-names: He
+        given-names: Kaiming
+    year: 2026
+    journal: "arXiv preprint arXiv:2602.04770"
+  - type: article
+    title: "Vocos: Closing the gap between time-domain and Fourier-based neural vocoders for high-quality audio synthesis"
+    authors:
+      - family-names: Siuzdak
+        given-names: Hubert
+    year: 2023
+    journal: "arXiv preprint arXiv:2306.00814"
